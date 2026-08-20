@@ -1,0 +1,12 @@
+# Local-only profile. Kept inside the project (not ~/.dbt) so the whole thing is
+# self-contained and reviewable -- this is a case study, not a shared warehouse.
+# Run dbt with --profiles-dir . (or from this directory, which dbt picks up).
+playon:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: playon.duckdb
+      threads: 4
+      # Raw is landed by scripts/load_raw.py, not by dbt.
+      schema: main
