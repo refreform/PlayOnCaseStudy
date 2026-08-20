@@ -1,0 +1,16 @@
+[project]
+name = "playon-dbt"
+version = "1.0.0"
+description = "PrepCast case study — dbt models over the raw playback/subscription extracts, on DuckDB."
+requires-python = ">=3.12"
+
+dependencies = [
+    "dbt-core>=1.12.2",
+    "dbt-duckdb>=1.11.0",
+    "duckdb>=1.5.5",
+]
+
+[tool.uv]
+# This project is a dbt project, not an installable Python package -- there is nothing to
+# build, so don't try. Without this, `uv sync` looks for a build backend and fails.
+package = false

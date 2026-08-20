@@ -1,0 +1,288 @@
+version: 2
+
+# Where a test belongs (see also _sources.yml):
+#
+#   * A SOURCE test answers "did the data arrive as promised?" -- enumerations, raw
+#     not_nulls, raw uniqueness. It points the blame upstream.
+#   * A STAGING test answers "did my transformation do what I claimed?" -- it covers columns
+#     this layer creates or changes, plus each model's published key contract.
+#
+# So accepted_values on a column staging passes through untouched lives at source only, and
+# is deliberately NOT repeated here. Transformed columns (sport, home_state) and derived ones
+# (event_ts_source_format, billing_period_months) are tested here, because nothing upstream
+# can test them. not_null IS repeated where staging casts: normalize_timestamp uses try_cast,
+# which returns NULL rather than failing, so the not_null on every *_at_utc column is a real
+# check on this layer's output, not a copy of the source's.
+#
+# This split assumes the project is built whole (`dbt build`). A run selecting only models
+# (`dbt test --select staging`) skips source tests and therefore has no enumeration coverage.
+
+models:
+
+  # ------------------------------------------------------------------ playback events
+  - name: stg_playback_events
+    description: >
+      **Grain: one row per playback telemetry event.** Cleaned and deduplicated client
+      telemetry, 215,445 rows (216,045 raw less 600 exact duplicates).
+
+      **Known issue -- orphaned foreign keys are retained here by design.** 4,496 rows
+      reference 38 asset_ids absent from the catalog, and 1,458 rows reference 42 user_ids
+      absent from the users extract. Staging cleans types and encodings; it does not decide
+      what counts. These are filtered in `marts/data/fct_session`, where the exclusion is
+      explicit and reconciled. Anyone joining this model directly to a dimension must expect
+      unmatched rows.
+
+      **Known issue -- timestamps in 25.5% of rows carried no timezone** and are assumed UTC.
+      See the normalize_timestamp macro; `event_ts_source_format` records which rows rest on
+      that assumption.
+    columns:
+      - name: event_id
+        description: Deduplicated primary key. Unique after the 600 identical pairs collapse.
+        data_tests:
+          - unique
+          - not_null
+      - name: session_id
+        description: One press of play through stop. 6,000 distinct sessions.
+        data_tests:
+          - not_null
+      - name: user_id
+        description: >
+          NULL for pre-sign-in viewing (35,230 rows). Not tested for not_null -- the nulls are
+          real. Not tested for referential integrity either: 1,458 orphans are retained here
+          deliberately.
+      - name: asset_id
+        description: Orphans retained -- see model description. Not relationship-tested here.
+        data_tests:
+          - not_null
+      - name: event_type
+        description: Passed through unchanged; enumeration tested at source.
+        data_tests:
+          - not_null
+      - name: event_at_utc
+        description: Normalized to naive UTC from three source encodings. Zero parse failures.
+        data_tests:
+          - not_null
+      - name: event_ts_source_format
+        description: >
+          Which encoding this row's timestamp arrived in. Retained so the UTC assumption on
+          `iso8601_no_timezone_assumed_utc` rows stays auditable rather than invisible.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['epoch_seconds', 'iso8601_utc', 'iso8601_no_timezone_assumed_utc']
+      - name: position_seconds
+        data_tests:
+          - not_null
+      - name: is_anonymous_view
+        data_tests:
+          - not_null
+    data_tests:
+      # The epoch branch of normalize_timestamp accepts any all-digit string, so a client
+      # emitting MILLISECONDS instead of seconds would produce a year-57000 timestamp that
+      # every other test here passes: it is not null, it is a valid timestamp, and it has a
+      # recognized source format. This is the test that catches it. All 42,474 current epoch
+      # values are 10 digits spanning 2025-09-01 to 2026-02-28.
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "event_at_utc between timestamp '2020-01-01' and timestamp '2027-01-01'"
+
+  # ------------------------------------------------------------------ asset catalog
+  - name: stg_asset_catalog
+    description: >
+      **Grain: one row per distinct video asset.** 862 rows.
+
+      The source `asset_id` is not unique -- 12 ids cover 24 rows, each pair being a game and
+      its "(Replay)". These are two real assets sharing one id, so `asset_key` (a surrogate
+      over asset_id + title + asset_type) is the true key and `asset_id` is retained as the
+      natural key for joining to telemetry.
+
+      **Known limitation:** playback events carry only `asset_id`, so events on those 12 ids
+      cannot be attributed to the live broadcast versus the replay. The surrogate key fixes
+      the dimension's grain; it cannot recover information the fact table never captured.
+
+      **This model is also the published catalog dimension.** A thin `dim_asset_catalog`
+      passthrough was deleted in WP-005 -- it added one derived column and hid three lineage
+      columns, which is not enough work to justify a model, and keeping it would have been the
+      same cargo-cult layering criticised in `models/intermediate/README.md`. Staging is
+      Data-owned and published in this project, so consuming it directly is coherent. Use
+      it for catalog reporting -- what exists, by sport, type and school. For anything joined
+      to viewing, use `dim_asset`, which is the join-safe grain.
+    columns:
+      - name: asset_key
+        description: Surrogate key. The real primary key of this model.
+        data_tests:
+          - unique
+          - not_null
+      - name: asset_id
+        description: >
+          Source natural key. Deliberately NOT unique -- 12 ids appear twice. Joining
+          telemetry on this column fans out on those 12; `dim_asset` resolves it.
+        data_tests:
+          - not_null
+      - name: asset_type
+        description: Passed through unchanged; enumeration tested at source.
+        data_tests:
+          - not_null
+      - name: is_replay
+        description: >
+          Derived from the title suffix -- identifies the second row of each colliding pair.
+          The 12 duplicated `asset_id`s are a game and its "(Replay)", and the title is the
+          only field that distinguishes them.
+        data_tests:
+          - not_null
+      - name: sport
+        description: Standardized from 24 raw variants to 10 sports.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values:
+                  ['BASEBALL', 'BASKETBALL', 'FOOTBALL', 'HOCKEY', 'LACROSSE',
+                   'SOCCER', 'SOFTBALL', 'TRACK', 'VOLLEYBALL', 'WRESTLING']
+      - name: duration_seconds
+        description: >
+          NULL for the 20 assets whose raw runtime was below 1 second (-600, -1, 0). Nullable
+          by design: a null completion ratio is honest, a zero denominator is not.
+      - name: has_invalid_duration
+        description: Flags those 20 assets so downstream models can count what they excluded.
+        data_tests:
+          - not_null
+      - name: scheduled_start_at_utc
+        data_tests:
+          - not_null
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - asset_id
+              - title
+              - asset_type
+
+  # ------------------------------------------------------------------ subscriptions
+  - name: stg_subscriptions
+    description: >
+      **Grain: one row per subscription status/plan change event.** 8,014 rows, a change log
+      rather than a dimension. Collapsing to validity windows (slowly changing dimension
+      work) happens in `dim_subscription_history`.
+
+      **Column renamed from source.** The source calls the amount `mrr_amount`, but annual
+      plans carry 79.99 -- a yearly price in a column named *monthly* recurring revenue. The
+      name is wrong at source, so it is not propagated: this model exposes
+      `billing_period_amount` (the charge per billing period) plus `billing_period_months`.
+      Normalizing to a true monthly figure is left to `dim_subscription_history`, because a
+      per-period amount is the right fact for billing reconciliation while monthly-normalized
+      revenue is a product-analytics view built on top of it.
+
+      **Known issue -- 118 rows reference 74 user_ids absent from the users extract**,
+      retained here and filtered in `dim_subscription_history`.
+    columns:
+      - name: subscription_change_key
+        description: Surrogate over (subscription_id, event_effective_ts). The primary key.
+        data_tests:
+          - unique
+          - not_null
+      - name: subscription_id
+        description: Not unique -- up to 3 change rows per subscription, by design.
+        data_tests:
+          - not_null
+      - name: user_id
+        description: >
+          A user may hold up to 7 subscriptions, and 391 pairs across 326 users overlap in
+          time. "The user's status on date X" is therefore ambiguous for those users and needs
+          a stated rule downstream.
+        data_tests:
+          - not_null
+      - name: status
+        description: Passed through unchanged; enumeration tested at source.
+        data_tests:
+          - not_null
+      - name: plan_type
+        description: Passed through unchanged; enumeration tested at source.
+        data_tests:
+          - not_null
+      - name: effective_at_utc
+        data_tests:
+          - not_null
+      - name: currency
+        description: Passed through unchanged; enumeration tested at source.
+        data_tests:
+          - not_null
+      - name: billing_period_amount
+        description: >
+          Amount charged per billing period, in `currency`. Renamed from the source's
+          misleading `mrr_amount` -- for annual plans this is a yearly figure.
+        data_tests:
+          - not_null
+      - name: usd_billing_period_amount
+        description: >
+          `billing_period_amount` converted via the fx_rates seed at the rate valid on the
+          change's effective date. NULL would mean an unmapped currency or an uncovered date,
+          so not_null here is the guard that a new currency cannot slip through unnoticed.
+        data_tests:
+          - not_null
+      - name: billing_period_months
+        description: >
+          Months covered by one billing period: monthly 1, annual 12, free_trial 0. Lets the
+          `dim_subscription_history` derive true monthly revenue without re-deciding what annual means.
+
+          **Zero is a real value, not a null stand-in.** A free trial bills nothing over no
+          period, so any downstream `amount / billing_period_months` divides by zero. Guard
+          it there; this layer states the fact rather than papering over it.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [0, 1, 12]
+    data_tests:
+      # Uniqueness on the NORMALIZED timestamp, not the raw string.
+      #
+      # _sources.yml tests (subscription_id, event_effective_ts) on the raw text, and the
+      # surrogate key hashes that same raw text. Both would pass if one subscription received
+      # two changes at the same instant written in different encodings -- "2026-01-05T00:00:00Z"
+      # and "2026-01-05 00:00:00" are different strings and the same moment. effective_at_utc
+      # is the column the slowly changing dimension windows get built on, so it is the one
+      # that has to be unique. Currently holds: zero collisions across all 8,014 rows.
+      #
+      # If this ever fails, it is not automatically a bug to fix in SQL -- see
+      # dev_docs/project/open-questions.md Q7a, which asks billing whether such a pair is a
+      # true duplicate or an artifact of how the extract is built.
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - subscription_id
+              - effective_at_utc
+
+  # ------------------------------------------------------------------ users
+  - name: stg_users
+    description: >
+      **Grain: one row per registered account.** 8,000 rows. The cleanest source -- the only
+      work is casting and standardizing `home_state` from 24 variant spellings.
+    columns:
+      - name: user_id
+        data_tests:
+          - unique
+          - not_null
+      - name: signup_at_utc
+        data_tests:
+          - not_null
+      - name: home_state
+        description: >
+          Standardized to uppercase two-letter codes. 469 lowercase codes uppercased; four
+          long forms (Florida, Texas, Georgia, Ga.) mapped explicitly. Shape is enforced by a
+          model-level test below.
+
+          not_null is required for that shape test to mean anything: `length(null) = 2`
+          evaluates to NULL, not false, so a column that went entirely null would satisfy it
+          silently. All 8,000 rows are populated today.
+        data_tests:
+          - not_null
+      - name: acquisition_channel
+        description: Passed through unchanged; enumeration tested at source.
+        data_tests:
+          - not_null
+    data_tests:
+      # Proves the home_state standardization actually worked: every value is a two-letter
+      # code. Would have failed on the raw data (32 rows were full names or "Ga.").
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "length(home_state) = 2"

@@ -1,0 +1,189 @@
+version: 2
+
+sources:
+  - name: raw
+    description: >
+      Raw operational extracts from the PrepCast source systems, landed by
+      `scripts/load_raw.py`. Every column is VARCHAR by design -- the loader does no type
+      sniffing, so this layer is a faithful copy of what the sources emitted and all casting
+      happens (and is tested) in staging. See the loader's docstring for why.
+    schema: raw
+    tables:
+
+      # ---------------------------------------------------------------- playback telemetry
+      - name: playback_events
+        description: >
+          Client-emitted playback telemetry, one row per event fired by the video player.
+          216,045 rows. The highest-volume source and the messiest.
+        columns:
+          - name: event_id
+            description: >
+              Client-generated event identifier. NOT unique in raw: 600 ids appear twice, and
+              in every case the two rows are byte-identical across all columns, which is what
+              makes deduplication safe. Confirmed 2026-08-18.
+            data_tests:
+              - not_null
+          - name: session_id
+            description: One press of play through stop. 6,000 distinct sessions.
+            data_tests:
+              - not_null
+          - name: user_id
+            description: >
+              Account watching. Legitimately NULL for pre-sign-in viewing -- 35,230 rows
+              (16.3%). Anonymity is a whole-session property: 978 sessions are entirely
+              anonymous and 5,022 have no nulls at all, with zero mixed sessions. So no
+              not_null test here; the nulls are real data, not a defect.
+          - name: asset_id
+            description: >
+              FK to asset_catalog. 4,496 rows (2.1%) reference 38 asset_ids that do not exist
+              in the catalog. Orphans are retained through staging by design and filtered in
+              `marts/data/fct_session` -- see the stg_playback_events description.
+            data_tests:
+              - not_null
+          - name: event_type
+            data_tests:
+              - not_null
+              - accepted_values:
+                  arguments:
+                    values: ['play', 'pause', 'buffer', 'heartbeat', 'stop']
+          - name: event_ts
+            description: >
+              Three encodings coexist: ISO-8601 with Z (54.9%), ISO-8601 space-separated with
+              no timezone (25.5%), and Unix epoch seconds (19.7%). Not correlated with
+              app_version or device_type, which rules out a single bad client build.
+              Normalized by the normalize_timestamp macro.
+            data_tests:
+              - not_null
+          - name: position_seconds
+            description: Playhead position. Range 0-10,051; no negatives, no non-numerics.
+            data_tests:
+              - not_null
+          - name: device_type
+            data_tests:
+              - accepted_values:
+                  arguments:
+                    values: ['ios', 'android', 'web', 'roku', 'firetv', 'appletv']
+          - name: bitrate_kbps
+            description: Range 800-6,000. Clean.
+
+      # ---------------------------------------------------------------- subscription log
+      - name: subscriptions
+        description: >
+          Append-style subscription change log, one row per status/plan change. 8,014 rows
+          covering 5,200 subscriptions held by 3,480 users.
+        columns:
+          - name: subscription_id
+            description: >
+              Stable across a subscription's lifetime and deliberately NOT unique here -- up
+              to 3 rows per subscription. Uniqueness lives on (subscription_id,
+              event_effective_ts), tested below.
+            data_tests:
+              - not_null
+          - name: user_id
+            description: >
+              FK to users. 118 rows reference 74 user_ids absent from the users extract.
+              A user may hold several subscriptions (up to 7), and 391 pairs across 326 users
+              overlap in time -- they are genuinely concurrent, not merely sequential.
+            data_tests:
+              - not_null
+          - name: plan_type
+            data_tests:
+              - accepted_values:
+                  arguments:
+                    values: ['monthly', 'annual', 'free_trial']
+          - name: status
+            data_tests:
+              - accepted_values:
+                  arguments:
+                    values: ['trialing', 'active', 'canceled', 'expired']
+          - name: event_effective_ts
+            description: >
+              Two encodings: ISO-8601 with Z (6,789) and space-separated with no timezone
+              (1,225). Same normalization as playback_events.
+            data_tests:
+              - not_null
+          - name: mrr_amount
+            description: >
+              Monthly recurring revenue at this change. SEMANTIC DEFECT: annual plans carry
+              79.99, which is an annual price in a column named *monthly* recurring revenue
+              (79.99/12 is about 6.67). Summing this column overstates annual-plan revenue
+              roughly 12x. Not corrected in staging -- staging casts and converts currency
+              only. Open question for the billing team.
+            data_tests:
+              - not_null
+          - name: currency
+            description: USD 7,935 / GBP 40 / EUR 39. Mixed, so mrr_amount is not summable raw.
+            data_tests:
+              - accepted_values:
+                  arguments:
+                    values: ['USD', 'GBP', 'EUR']
+        data_tests:
+          - dbt_utils.unique_combination_of_columns:
+              arguments:
+                combination_of_columns:
+                  - subscription_id
+                  - event_effective_ts
+
+      # ---------------------------------------------------------------- catalog
+      - name: asset_catalog
+        description: >
+          Video asset metadata, 862 rows. Declared grain (one row per asset) is FALSE: 12
+          asset_ids appear twice. Each pair is a game and its "(Replay)" -- same schools,
+          sport, scheduled start and duration, with one row titled "(Replay)". Nine pairs are
+          LIVE + VOD, three are VOD + VOD. They are two genuinely distinct assets that were
+          issued the same id.
+        columns:
+          - name: asset_id
+            description: >
+              Natural key from the source, NOT unique (12 duplicates, see table description).
+              Staging adds a surrogate key; this column is retained for lineage and joins.
+            data_tests:
+              - not_null
+          - name: asset_type
+            data_tests:
+              - not_null
+              - accepted_values:
+                  arguments:
+                    values: ['LIVE', 'VOD']
+          - name: sport
+            description: >
+              24 raw variants for 10 real sports: casing (Hockey/HOCKEY), lowercase
+              (football), and abbreviations (BBALL, VB, FB). Standardized in staging.
+            data_tests:
+              - not_null
+          - name: duration_seconds
+            description: >
+              Runtime. 20 assets carry impossible values: five at -600, five at -1, ten at
+              0. This column is the denominator of any completion metric, so bad values are
+              nulled in staging rather than left to produce silent nonsense.
+            data_tests:
+              - not_null
+          - name: scheduled_start_ts
+            description: Single encoding (ISO-8601 with Z) across all 862 rows. Clean.
+            data_tests:
+              - not_null
+
+      # ---------------------------------------------------------------- accounts
+      - name: users
+        description: Registered account records, 8,000 rows. The cleanest of the four extracts.
+        columns:
+          - name: user_id
+            description: Unique across all 8,000 rows. The only source key that holds as-is.
+            data_tests:
+              - not_null
+              - unique
+          - name: signup_ts
+            description: Single encoding (ISO-8601 with Z) across all 8,000 rows. Clean.
+            data_tests:
+              - not_null
+          - name: home_state
+            description: >
+              Self-reported US state. 469 rows are lowercase two-letter codes, and 32 are not
+              two characters at all -- full names (Florida, Texas, Georgia) and one
+              abbreviation with a period (Ga.). Standardized in staging.
+          - name: acquisition_channel
+            data_tests:
+              - accepted_values:
+                  arguments:
+                    values:
+                      ['organic', 'paid_social', 'referral', 'partner', 'school_email', 'app_store']

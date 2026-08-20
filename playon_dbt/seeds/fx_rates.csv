@@ -1,0 +1,4 @@
+currency,rate_to_usd,valid_from,valid_to,source_note
+USD,1.00,1900-01-01,2999-12-31,identity
+GBP,1.27,1900-01-01,2999-12-31,placeholder - awaiting finance-maintained rates
+EUR,1.09,1900-01-01,2999-12-31,placeholder - awaiting finance-maintained rates

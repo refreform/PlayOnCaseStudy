@@ -1,0 +1,84 @@
+name: playon
+version: 1.0.0
+config-version: 2
+
+profile: playon
+
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+seed-paths: ["seeds"]
+snapshot-paths: ["snapshots"]
+
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  playon:
+    # Descriptions in the schema YAMLs are written to the warehouse as table and column
+    # COMMENTs, so an analyst inspecting the database sees the same documentation as someone
+    # reading the repo. Docs that live only in the repo drift from the tables they describe.
+    +persist_docs:
+      relation: true
+      columns: true
+
+    # Medallion layering, matching the vocabulary the case study uses
+    # (raw -> cleaned -> standardized/dimensional -> curated marts).
+    # Raw lives outside dbt: scripts/load_raw.py lands it, dbt reads it as a source.
+    staging:
+      # Cleaned. One model per source table, no joins, no business logic.
+      # Types cast, timestamps normalized, categoricals standardized.
+      +materialized: view
+      +schema: staging
+    intermediate:
+      # Genuinely private plumbing: models with no standalone meaning, existing only to keep a
+      # mart readable. Currently EMPTY, and that is deliberate rather than an oversight -- a
+      # four-source project does not generate much private glue. Three models that lived here
+      # were promoted to marts/data once it became clear they were shared assets misfiled
+      # as plumbing (WP-004). An empty layer is better than a layer that hides publishable work.
+      +materialized: view
+      +schema: intermediate
+
+    marts:
+      +materialized: table
+
+      data:
+        # DATA-OWNED. Models that encode facts about the source systems, not our opinions.
+        # The test: if the Product team's definition of engagement changed tomorrow, would this
+        # model change? If no, it belongs here, and any team consuming PrepCast data can adopt it.
+        +schema: marts_data
+
+      product:
+        # PRODUCT-OWNED (the Product team). Models that encode the Product team's definitions --
+        # all what counts as an engaged view. Another team may reasonably disagree with these,
+        # which is exactly why they are separated: the Data layer stays adoptable, and our
+        # opinions stay cheap to change.
+        +schema: marts_product
+
+vars:
+  # The engaged-view threshold. Decided 2026-08-19 by the owner; full reasoning in
+  # dev_docs/domain/engaged-view.md section 6. Declared here so the threshold is one named knob
+  # rather than a number buried in SQL.
+  #
+  # Reference it as {{ var('engaged_view_min_completion_pct') }} with NO default -- a default
+  # would silently bake in a threshold nobody chose, the exact failure this knob prevents.
+  #
+  # 0.30 is the midpoint of an EMPTY band in the completion distribution (0.20 - 0.478). Every
+  # value from 0.21 to 0.47 classifies all 5,739 sessions identically, so nothing depends on
+  # the precise number. Do not tune it against a retention result (see the handoff doc).
+  engaged_view_min_completion_pct: 0.30
+
+  # The secondary abandoned/sampled cut, used only by the three-tier split that is NOT the
+  # published definition (see engaged-view.md 6.4). Declared here for the same reason as the
+  # threshold above: it was previously a bare 0.10 literal in two different models, which is
+  # two places to change and one place to forget.
+  engaged_view_sampled_min_completion_pct: 0.10
+
+  # The far-future sentinel marking an open-ended validity window. dim_subscription_history
+  # MINTS it on a subscription's last change; fct_user_paid_spells COMPARES against it to
+  # derive is_open_ended. Those two must agree, and when the value was a literal in both files
+  # a change to one would have silently made every spell look closed -- no error, no failing
+  # test, just a wrong boolean. One declaration, referenced twice.
+  open_window_sentinel: '2999-12-31 23:59:59'

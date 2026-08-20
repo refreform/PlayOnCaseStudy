@@ -1,0 +1,50 @@
+version: 2
+
+seeds:
+  - name: fx_rates
+    description: >
+      Currency conversion rates to USD, valid over a date range. Modelled as an
+      append-only rate table rather than hardcoded constants so that rate changes over time
+      are auditable: a revenue figure recomputed next quarter reproduces the same number for
+      a past period, which flat constants cannot guarantee.
+
+      Owned by finance in a production setting. Adding a rate change means closing the open
+      row's `valid_to` and appending a new row -- never editing a historical rate, since that
+      silently restates past reporting.
+
+      **Current values are placeholders**, not market data. The case study ships no rate
+      table and no rate dates. They affect 79 of 8,014 subscription rows (GBP 40, EUR 39),
+      so they make revenue summable without materially moving any headline number. Do not
+      quote converted revenue to the cent on the strength of them.
+    config:
+      column_types:
+        currency: varchar
+        rate_to_usd: double
+        valid_from: date
+        valid_to: date
+        source_note: varchar
+    columns:
+      - name: currency
+        description: ISO 4217 code. Must cover every currency present in stg_subscriptions.
+        data_tests:
+          - not_null
+      - name: rate_to_usd
+        description: Multiply an amount in `currency` by this to get USD.
+        data_tests:
+          - not_null
+      - name: valid_from
+        description: Inclusive start of the period this rate applies to.
+        data_tests:
+          - not_null
+      - name: valid_to
+        description: Inclusive end. The open row uses a far-future sentinel date.
+        data_tests:
+          - not_null
+    data_tests:
+      # Guards the fan-out risk: if two rows for one currency ever cover the same date, the
+      # join in stg_subscriptions silently duplicates subscription rows.
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - currency
+              - valid_from

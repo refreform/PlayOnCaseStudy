@@ -1,0 +1,262 @@
+version: 2
+
+# =============================================================================================
+# DATA-OWNED MARTS
+#
+# Every model here encodes a FACT about the source systems, not an opinion of the Product team.
+# The test for belonging in this folder:
+#
+#     If the Product team's definition of engagement changed tomorrow, would this model change?
+#
+# If no, it belongs here and any team consuming PrepCast data can adopt it. If yes, it belongs
+# in ../product. That single question is what the folder split makes enforceable rather than
+# aspirational.
+#
+# Three of these models (dim_asset, dim_subscription_history, fct_user_paid_spells) spent part
+# of their life in the intermediate layer, filed as private plumbing. They were promoted in
+# WP-004 once it was clear they were shared assets: leaving them private would have forced
+# other teams to re-derive the same slowly-changing-dimension windows, interval merges and
+# catalog resolution, each slightly differently.
+# =============================================================================================
+
+models:
+
+  - name: dim_asset
+    description: >
+      **Grain: one row per `asset_id`.** 850 rows. The join-safe asset dimension — this is what
+      facts join.
+
+      `stg_asset_catalog` has 12 `asset_id`s covering two assets each (a game and its
+      "(Replay)"), so joining events there fans 216,045 rows out to 218,782. This model carries
+      only the columns on which those pairs **agree** — verified 12 of 12 for `sport`,
+      `home_school`, `away_school`, `scheduled_start_at_utc` and `duration_seconds`. Restricted
+      to those columns the pairs are genuine duplicates, so collapsing is deduplication rather
+      than a judgement call.
+
+      **`title` and `asset_type` are deliberately absent.** An earlier version kept them and
+      nulled them for the ambiguous 12; that was rejected because a column which is sometimes a
+      fact and sometimes an admission forces every consumer to remember which. Omitting it
+      states the boundary once, in the schema. Both live in `stg_asset_catalog`, which carries the
+      full catalog at `asset_key` grain for catalog reporting.
+
+      **Cost:** `asset_type` is unambiguous for 838 of 850 assets and is withheld from all of
+      them to stay honest about 12. Accepted because LIVE and VOD are behaviourally
+      indistinguishable here. Revisit if that changes.
+    columns:
+      - name: asset_id
+        data_tests: [unique, not_null]
+      - name: has_ambiguous_identity
+        description: True for the 12 ids covering a game and its replay.
+        data_tests: [not_null]
+      - name: source_row_count
+        description: Catalog rows sharing this asset_id. >1 flags the live/replay collision.
+        data_tests: [not_null]
+      - name: sport
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values:
+                  ['BASEBALL', 'BASKETBALL', 'FOOTBALL', 'HOCKEY', 'LACROSSE',
+                   'SOCCER', 'SOFTBALL', 'TRACK', 'VOLLEYBALL', 'WRESTLING']
+      - name: duration_seconds
+        description: NULL for the 20 assets with invalid runtimes. Sessions on them are excluded from fct_session.
+
+  - name: fct_session
+    description: >
+      **Grain: one row per viewing session.** 5,739 rows. Sessionization, and nothing else.
+
+      **Named `fct_`, not `dim_` (renamed in WP-009).** It carries measures at a transaction
+      grain — `watch_minutes`, `event_count`, `buffer_events`, `completion_pct` — which makes it
+      a fact table whatever the word "session" suggests. `dim_session` invited a reader to
+      expect attributes to describe rows with rather than measures to aggregate.
+
+      Every column is a fact about what the player reported — how long, how far, on what device.
+      **`completion_pct` is here because a ratio is a measurement; `is_engaged_view` is not,
+      because a threshold is an opinion.** That distinction is the ownership boundary, and it
+      is why the classification lives in `product/fct_session_engagement`.
+
+      **KNOWN ISSUE — orphans are filtered here.** 261 of 6,000 staged sessions are dropped:
+      123 whose `asset_id` has no catalog row, 138 whose asset has an invalid runtime. Both lack
+      a completion denominator. **The excluded sessions remain intact in `stg_playback_events`
+      — any team that wants them should read from there.** Asserted by
+      `assert_session_exclusions_reconcile` so the exclusion cannot drift silently.
+
+      **Measurement notes**, each of which was a trap: completion uses **heartbeat positions
+      only** (`stop.position_seconds` jumps ~237s past the last heartbeat, inflating completion
+      ~11%); `watch_minutes` counts **distinct** heartbeat positions (2,236 duplicate heartbeat
+      emissions would otherwise overstate watch time by 1.17%).
+    columns:
+      - name: session_id
+        data_tests: [unique, not_null]
+      - name: user_id
+        description: Null for the 929 anonymous sessions. Legitimately null; not tested.
+      - name: asset_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_asset')
+                field: asset_id
+      - name: completion_pct
+        description: Watched fraction of runtime. A measurement — the threshold that turns it into a judgement lives in product.
+        data_tests: [not_null]
+      - name: watch_minutes
+        description: Distinct heartbeat positions. Cadence is exactly 60s, so this is minutes watched.
+        data_tests: [not_null]
+      - name: has_unknown_user
+        description: >
+          Identified, but the account is absent from the users extract. 38 sessions. Found by
+          `assert_fct_user_engagement_grain`, not by inspection — they look attributable and
+          vanished silently at the join to `dim_user` before that test existed.
+        data_tests: [not_null]
+      - name: is_anonymous_session
+        data_tests: [not_null]
+      - name: buffers_per_10min
+        description: >
+          Rate, not a count. Buffer *counts* rise with session length and mislead badly; the rate
+          is flat at ~0.32 across every engagement level, which is what ruled out quality of
+          experience as an explanation for abandonment.
+
+  - name: dim_subscription_history
+    description: >
+      **Grain: one row per subscription state, valid over a date range.** 7,896 rows. A type 2
+      slowly changing dimension (SCD) built from the billing change log.
+
+      Deliberately **not** a dbt snapshot. Snapshots capture history from a source that
+      overwrites itself; this extract already *is* the history, so windows are derived from
+      recorded change events and the validity dates reflect the business's timeline rather than
+      our scheduler's.
+
+      **Monthly normalization happens here.** Annual plans carry 79.99 — a yearly price in a
+      column the source named *monthly* recurring revenue. `monthly_amount` and
+      `usd_monthly_amount` are comparable across plan types and safe to sum; annual resolves to
+      6.67. Free trials are 0.00 rather than a division by zero.
+
+      **KNOWN ISSUE — 118 orphan rows filtered** (74 user_ids absent from the users extract).
+      They remain in `stg_subscriptions`.
+    columns:
+      - name: subscription_change_key
+        data_tests: [unique, not_null]
+      - name: subscription_id
+        data_tests: [not_null]
+      - name: user_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_users')
+                field: user_id
+      - name: valid_from
+        data_tests: [not_null]
+      - name: valid_to
+        description: Current state uses the sentinel 2999-12-31 rather than NULL, so range predicates work without coalescing.
+        data_tests: [not_null]
+      - name: is_current_state
+        data_tests: [not_null]
+      - name: monthly_amount
+        data_tests: [not_null]
+      - name: usd_monthly_amount
+        description: Safe to sum across currencies and plan types.
+        data_tests: [not_null]
+      - name: billing_period_months
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [0, 1, 12]
+
+  - name: fct_user_paid_spells
+    description: >
+      **Grain: one row per continuous period during which a user was a paying customer.**
+      3,197 rows, merged from 4,277 paid windows.
+
+      A factless fact — it records a timespan rather than a measure. Exists because 319
+      overlapping subscription pairs across 268 users involve two *paid* plans, which makes
+      "was this person paying on date X" ambiguous at subscription grain. Worse, a user who
+      cancels one of two concurrent subscriptions looks churned while still paying; counting
+      subscription cancellations as churn would overstate it for exactly those users. **859
+      spells absorb more than one window**, so the problem is real, not theoretical.
+
+      **Boundary rule:** windows that merely touch (one ends exactly when the next begins) form
+      one continuous spell — there is no instant where the user was unsubscribed.
+
+      Correctness is asserted by `assert_paid_spells_no_overlap`, which specifically catches the
+      nested-window case where a short window sits wholly inside a longer one.
+    columns:
+      - name: paid_spell_key
+        data_tests: [unique, not_null]
+      - name: user_id
+        data_tests: [not_null]
+      - name: paid_from
+        data_tests: [not_null]
+      - name: paid_to
+        data_tests: [not_null]
+      - name: subscriptions_in_spell
+        description: How many windows merged into this spell. >1 means genuine overlap.
+        data_tests: [not_null]
+      - name: is_open_ended
+        data_tests: [not_null]
+
+  - name: dim_user
+    description: >
+      **Grain: one row per registered account.** 8,000 rows. The conformed user dimension.
+
+      Attributes only — no engagement measures, which live in `product/fct_user_engagement`.
+      Keeping the Product team's engagement definition out of the dimension is precisely what lets the
+      Data team adopt this table without inheriting our definition.
+
+      Subscription state is included as flags and counts, because "what plan is this person on"
+      is an attribute of the person. Expressed as scalars rather than an array of subscription
+      ids: arrays are hostile to most BI tools and this dimension is meant to be reused beyond
+      the Product team. Anyone needing the enumeration joins `dim_subscription_history`.
+    columns:
+      - name: user_id
+        data_tests: [unique, not_null]
+      - name: subscription_count
+        data_tests: [not_null]
+      - name: has_subscription
+        data_tests: [not_null]
+      - name: has_ever_paid
+        description: Held a monthly or annual plan at some point. Trials do not count.
+        data_tests: [not_null]
+      - name: has_ever_churned
+        description: >
+          **A plan this user actually paid for reached `canceled` or `expired`.**
+
+          **Restricted to paid plans in WP-009.** It previously ran over every row of a user's
+          history, so a lapsed free trial counted as churn — 564 trial rows reach `expired`
+          without a cent ever being charged. Someone who tried the product and never converted
+          has not churned; they never retained, and counting them inflates churn with people
+          who were never customers. Trial-only users are identified by `has_ever_paid = false`.
+        data_tests: [not_null]
+      - name: is_currently_subscribed
+        description: >
+          **The one "subscribed right now" flag.** Replaced a redundant pair — this and
+          `has_open_paid_spell` agreed on all 8,000 users and could not disagree by
+          construction, since `status = 'active'` only ever occurs on a paid plan. Excludes
+          free trials: trialing is not paying. Order-independent, unlike `latest_status`.
+        data_tests: [not_null]
+      - name: latest_change_status
+        description: >
+          Status of this user's **most recent subscription change**, via `arg_max` on
+          `valid_from`. Note the name: it is not "the user's status", and cannot be for anyone
+          holding concurrent subscriptions — **509 users have their most recent change on a
+          different subscription than their active one** and are correctly still subscribed.
+
+          **Was a bug twice over.** An earlier `max(case when is_current_state then status end)`
+          picked the alphabetically largest status (`max('active','canceled') = 'canceled'`),
+          mislabelling 748 users; and it was called `latest_status`, which invited exactly the
+          misreading the data cannot support. For a yes/no question use
+          `is_currently_subscribed`, which is order-independent.
+      - name: latest_change_plan_type
+        description: Plan on the most recent change. Same caveat as `latest_change_status`.
+      - name: current_usd_mrr
+        data_tests: [not_null]
+      - name: total_paid_days
+        description: From merged paid spells, so concurrent subscriptions do not double-count.
+        data_tests: [not_null]
+      - name: home_state
+        data_tests: [not_null]
+      - name: acquisition_channel
+        data_tests: [not_null]
+

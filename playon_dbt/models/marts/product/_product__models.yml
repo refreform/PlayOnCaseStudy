@@ -1,0 +1,161 @@
+version: 2
+
+# =============================================================================================
+# PRODUCT-OWNED MARTS  (the Product team)
+#
+# Every model here encodes one of OUR definitions -- above all, what counts as an engaged view.
+# Another team may reasonably disagree with these, which is exactly why they are separated from
+# ../data: the Data layer stays adoptable by anyone, and our opinions stay cheap to
+# change.
+#
+# The test for belonging here:
+#
+#     If the Product team's definition of engagement changed tomorrow, would this model change?
+#
+# If yes, it belongs here. Both models below answer yes. Nothing in ../data does.
+#
+# Note how little lives here. That is the point -- the opinion surface is deliberately small,
+# and the threshold itself is a single declared var in dbt_project.yml rather than a number
+# scattered through SQL.
+# =============================================================================================
+
+models:
+
+  - name: fct_session_engagement
+    description: >
+      **Grain: one row per viewing session.** 5,739 rows. The model that carries the Product team's
+      opinion, and deliberately nothing else.
+
+      It takes the factual `completion_pct` from `data/fct_session` and applies a threshold.
+      That is its entire contribution — and its entire reason for existing as a separate model.
+      An earlier version applied the threshold inside the session model itself, which would have
+      forced any team adopting sessionization to inherit our 30% cut whether they agreed or not.
+
+      **The definition:** an engaged view is a session in which the viewer watched at least 30%
+      of the asset's runtime. 1,826 of 5,739 sessions (31.8%) qualify.
+
+      **Why 30% is not arbitrary:** it is the midpoint of an *empty band* in the observed
+      completion distribution (0.200 → 0.478). Every threshold in that band classifies all 5,739
+      sessions identically, so nothing depends on the precise value — and the knob cannot be
+      quietly tuned toward a retention result. Full reasoning in
+      `dev_docs/domain/engaged-view.md` §5.2 and §6.
+    columns:
+      - name: session_id
+        description: >
+          One row per session in `data/fct_session`, and every session classified. The
+          relationship test is what holds that 1:1 — `fct_user_engagement` joins these two
+          models on `session_id`, so a session appearing here without a match upstream would
+          fan out or vanish depending on join direction.
+        data_tests:
+          - unique
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('fct_session')
+                field: session_id
+      - name: user_id
+        description: Null for the 929 anonymous sessions. Legitimately null; not tested.
+      - name: completion_pct
+        data_tests: [not_null]
+      - name: is_engaged_view
+        description: The published definition. completion_pct >= var('engaged_view_min_completion_pct').
+        data_tests: [not_null]
+      - name: engagement_tier
+        description: >
+          Secondary three-tier split — `abandoned` / `sampled` / `engaged`. **Not the published
+          definition.** Retained because the middle tier (watched 17–20%, then stopped, 1,760
+          sessions) is a churn-reduction target worth handing to growth. See engaged-view.md
+          §6.4 — and note §5.9: these tiers show no retention signal in this dataset, so the
+          commercial case rests on the behaviour being interpretable, not on a measured effect.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['abandoned', 'sampled', 'engaged']
+
+  - name: fct_user_engagement
+    description: >
+      **Grain: one row per registered user.** 8,000 rows. The headline table.
+
+      Answers the business question directly — *how does viewership behaviour relate to
+      subscription retention?* — which is a question about people, so the fact is at user grain.
+
+      **Why user grain and not session grain.** A session-grain fact answers "what do sessions
+      look like", and aggregating it weights heavy viewers by how often they showed up. A
+      user-grain fact answers "what do users look like", which is what retention means. Here the
+      distinction is nearly moot (median user has one session) but that is an accident of
+      synthetic data; on real data the two diverge sharply, and the grain of the fact silently
+      decides which question gets answered. Session detail is in `data/fct_session`.
+
+      **Spine is all 8,000 registered users, not just those who watched.** Users who never
+      watched are the most unengaged cohort there is; excluding them would bias every
+      engagement-vs-retention comparison toward people who already showed up. Their engagement
+      measures are **0, not null** — zero sessions is a measurement, not a gap.
+
+      **Two populations cannot appear here**, both retained in `data/fct_session`: anonymous
+      sessions (no `user_id`), and 38 sessions whose `user_id` is absent from the users extract.
+      Both are real viewing with no account to attribute it to.
+
+      **No fan-out by construction** — every input is aggregated to user grain before joining.
+      Asserted by `assert_fct_user_engagement_grain`, which is also the test that caught the
+      38-session leak.
+    columns:
+      - name: user_id
+        description: >
+          The spine is `dim_user`, so this is one row per registered account. The relationship
+          test states that contract explicitly rather than leaving it implied by a left join.
+        data_tests:
+          - unique
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_user')
+                field: user_id
+      - name: is_engaged_user
+        description: >
+          **The user-level definition: at least one engaged view.** "At least one" rather than a
+          majority-of-sessions rule because the median user has exactly one session, so a ratio
+          would be computed over a denominator of 1 for most of the population.
+          `engaged_session_count` and `session_count` are both exposed so a different rule can be
+          applied without remodelling.
+        data_tests: [not_null]
+      - name: engagement_tier
+        description: Secondary tiering for growth handoff. Not the published definition.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['never_watched', 'abandoned', 'sampled', 'engaged']
+      - name: session_count
+        description: Zero for users who never watched — a measurement, not a null.
+        data_tests: [not_null]
+      - name: engaged_session_count
+        data_tests: [not_null]
+      - name: total_watch_minutes
+        data_tests: [not_null]
+      - name: best_completion_pct
+        description: NULL where the user never watched — they have no completion, as distinct from a completion of zero.
+      - name: has_ever_paid
+        data_tests: [not_null]
+      - name: has_ever_churned
+        description: >
+          A plan the user actually paid for ended. **Restricted to paid plans in WP-009** — it
+          previously counted a lapsed free trial as churn. See `data/dim_user`.
+        data_tests: [not_null]
+      - name: is_currently_subscribed
+        description: Holds at least one active paid subscription right now. Excludes free trials.
+        data_tests: [not_null]
+      - name: has_churned_from_paid
+        description: >
+          Held a paid plan and no longer active. **States no causality** — it does not check that
+          engagement preceded the churn. A causal reading needs a time-ordered cohort test
+          (engagement in window W vs retention at W+30), which this table supports but does not
+          perform. The measured result and its caveats: `dev_docs/domain/engaged-view.md` §5.9
+          — which found no relationship between engagement and retention in this dataset.
+        data_tests: [not_null]
+      - name: current_usd_mrr
+        description: Normalized USD monthly recurring revenue. Safe to sum.
+        data_tests: [not_null]
+      - name: total_paid_days
+        description: From merged paid spells, so concurrent subscriptions do not double-count.
+        data_tests: [not_null]
